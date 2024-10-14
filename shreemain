@@ -1,0 +1,533 @@
+import requests, logging, json, datetime, time, imgkit, traceback, sys
+import pandas as pd
+from logging.handlers import RotatingFileHandler
+from threading import Thread
+from PIL import Image
+
+import pyotp
+import urllib
+from hashlib import sha256
+from io import StringIO
+
+use_token = False # True - use existing token from all_broker_tokens.json, False - log in using fyers_cred.json, None - specify token as string
+debug_mode = False # run on holidays and after market hours, update every 30 seconds
+use_syms = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY', 'SENSEX', 'BANKEX', 'TCS', 'RELIANCE', 'SBIN', 'HDFCBANK', 'ICICIBANK', 'INFY']
+
+pd.options.mode.copy_on_write = True
+
+formatter_string = '%(asctime)s.%(msecs)03d - #%(threadName)s - %(levelname)s - %(module)s - %(funcName)s - %(message)s'
+formatter_string_date = '%Y-%m-%d %H:%M:%S'
+logging.captureWarnings(True)
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+logging.getLogger('PIL').setLevel(logging.INFO)
+formatter = logging.Formatter(fmt=formatter_string, datefmt=formatter_string_date)
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.DEBUG)
+console_handler.setFormatter(formatter)
+file_handler = RotatingFileHandler('oigrail_new.log', mode='a', maxBytes=1e6, backupCount=3)
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(formatter)
+logger.handlers = [console_handler, file_handler]
+logging.info('*****************')
+
+HOLIDAYS = ['17-07-2024', '15-08-2024', '02-10-2024', '01-11-2024', '15-11-2024', '25-12-2024']
+HOLIDAYS = [datetime.datetime.strptime(h, '%d-%m-%Y').date() for h in HOLIDAYS]
+EXTRAS = ['20-01-2024']
+EXTRAS = [datetime.datetime.strptime(e, '%d-%m-%Y').date() for e in EXTRAS]
+
+def tgsendmsg(msg, tgid=-1002008545637, message_thread_id="", error=False):
+    for ix in range(10):
+        try:
+            if error:
+                msg = "ERROR - " + msg
+                tgid = -1001289051631
+                message_thread_id = 6336
+            tgreq = requests.post(f'https://api.telegram.org/bot1126138584:AAH1j8yzsLFf4NGH-48CzBsp6BLe61U7JKM/sendMessage?chat_id={tgid}&text={msg}&message_thread_id={message_thread_id}')
+        except requests.exceptions.ConnectionError:
+            pass
+        else:
+            if "result" in tgreq.json(): break
+
+def tgsendimg(img, sym, ndel, msg='', tgid=-1002116403219):
+    global tgsendids
+    for ix in range(10):
+        try:
+            with open(img, 'rb') as imgfile:
+                tgreq = requests.post('https://api.telegram.org/bot1126138584:AAH1j8yzsLFf4NGH-48CzBsp6BLe61U7JKM/sendPhoto', data = {"chat_id" : tgid, "parse_mode" : "html", "caption" : msg}, files = {"photo" : imgfile})
+        except requests.exceptions.ConnectionError:
+            pass
+        else:
+            if "result" in tgreq.json(): break
+    for ix in range(10):
+        if tgsendids[sym] is None:
+            break
+        try:
+            requests.post('https://api.telegram.org/bot1126138584:AAH1j8yzsLFf4NGH-48CzBsp6BLe61U7JKM/deleteMessage', data = {"chat_id" : tgid, "message_id" : tgsendids[sym]})
+        except requests.exceptions.ConnectionError:
+            pass
+        else:
+            break
+    if ndel:
+        tgsendids[sym] = None
+    else:
+        tgsendids[sym] = tgreq.json()["result"]["message_id"]
+
+def numformat(num):
+    numint = str(num).split('.')
+    numdec = None
+    if len(numint) > 1:
+        numdec = numint[1]
+    numint = numint[0]
+    if len(numint) == 4 and numint[0] == '-':
+        fmint = numint
+    else:
+        fmint = ''.join([f"{digit}{',' if (len(numint)-i-1)%2==1 and i!=len(numint)-2 else ''}" for i, digit in enumerate(numint)])
+    return (fmint + '.' + numdec) if numdec else fmint
+
+def df_image(dfr, sym, tm):
+    ndel = False
+    rc = 15
+    if len(dfr)%rc == 0:
+        ndel = True
+    dfx = dfr.tail(rc)
+    dfx.reset_index(inplace=True, drop=True)
+    df = pd.DataFrame(columns=dfcols)
+
+    for i in dfx.index:
+        row = dfx.loc[i]
+        row['Analysis'] = f'<span class="fill_{row["Analysis"].lower()}">{row["Analysis"]}</span>'
+
+        if i==0:
+            row['CE_lots'] = f'<span>{numformat(row["CE_lots"])}</span>'
+            row['PE_lots'] = f'<span>{numformat(row["PE_lots"])}</span>'
+            row['Spot'] = f'<span>{numformat(row["Spot"])}</span>'
+            df.loc[len(df)] = row
+            continue
+
+        prev = dfx.loc[i-1]
+
+        if row['CE_lots'] > prev['CE_lots']:
+            row['CE_lots'] = f'<span class="g">{numformat(row["CE_lots"])}</span>'
+        elif row['CE_lots'] < prev['CE_lots']:
+            row['CE_lots'] = f'<span class="r">{numformat(row["CE_lots"])}</span>'
+        else:
+            row['CE_lots'] = f'<span>{numformat(row["CE_lots"])}</span>'
+
+        if row['PE_lots'] > prev['PE_lots']:
+            row['PE_lots'] = f'<span class="g">{numformat(row["PE_lots"])}</span>'
+        elif row['PE_lots'] < prev['PE_lots']:
+            row['PE_lots'] = f'<span class="r">{numformat(row["PE_lots"])}</span>'
+        else:
+            row['PE_lots'] = f'<span>{numformat(row["PE_lots"])}</span>'
+
+        if row['Spot'] > prev['Spot']:
+            row['Spot'] = f'<span class="g">{numformat(row["Spot"])} (+{round(row["Spot"]-prev["Spot"], 2)})</span>'
+        elif row['Spot'] < prev['Spot']:
+            row['Spot'] = f'<span class="r">{numformat(row["Spot"])} ({round(row["Spot"]-prev["Spot"], 2)})</span>'
+        else:
+            row['Spot'] = f'<span>{numformat(row["Spot"])}</span>'
+
+        df.loc[len(df)] = row
+
+    css_def = """
+    <style>
+    table {border-collapse: collapse;
+           border-spacing: 0;}
+    //div {padding-right: 10px;}
+    * {white-space: nowrap;
+       font-family: Calibri, sans-serif;}
+    span.r {color : red;}
+    span.g {color : green;}
+    span.fill_bear {display: block; background: #EC7063;}
+    span.fill_bull {display: block; background: mediumseagreen;}
+    span.fill_neutral {display: block; background: yellow;}
+    td, th {border: 1px solid;
+            text-align: center;
+            padding: 5px;}
+    th {background: #FAFAFA;
+        font-weight: bold;}
+    </style>
+    """ + f"<h3 align='center'>{sym} - {tm}</h3><div>"
+
+    fnm = f'out_{sym}.png'
+
+    html_content = css_def+df.to_html(index=False, escape=False)+"</div>"
+    """
+    with open(fnm+'.html', 'w') as html_file:
+        html_file.write(html_content)
+    """
+    imgnf = imgkit.from_string(html_content, fnm, options = {'zoom' : 1.5, 'enable-local-file-access':'', 'quality': 70, 'height': 800})
+    Image.open(fnm).rotate(90, expand=True).save(fnm)
+
+    t = Thread(target=tgsendimg, args=(fnm, sym, ndel))
+    t.run()
+
+def rget(sessobj, ep, headers, timeout=None, params={}, return_json=True):
+    if timeout is None:
+        timeout = TIMEOUT
+    for i in range(10):
+        try:
+            req = sessobj.get(ep, headers=headers, timeout=timeout, params=params)
+            time.sleep(2)
+            if req.status_code == 200:
+                if return_json:
+                    try:
+                        return req.json()
+                    except:
+                        logging.error(f'{traceback.format_exc()}\n{req.status_code} - {req.text}\n')
+                        time.sleep(5)
+                else:
+                    return req
+            else:
+                logging.error(f'{ep} - {params} - {req.status_code} - {req.text}\n')
+                time.sleep(5)
+        except:
+            logging.error(f'{ep} - {params} - {traceback.format_exc()}\n')
+            time.sleep(5)
+
+def fyers_login(conf, tries=5):
+    BASE_URL = "https://api-t2.fyers.in/vagator/v2"
+    BASE_URL_2 = "https://api-t1.fyers.in/api/v3"
+    URL_SEND_LOGIN_OTP = BASE_URL + "/send_login_otp"
+    URL_VERIFY_TOTP = BASE_URL + "/verify_otp"
+    URL_VERIFY_PIN = BASE_URL + "/verify_pin"
+    URL_TOKEN = BASE_URL_2 + "/token"
+    URL_VALIDATE_AUTH_CODE = BASE_URL_2 + "/validate-authcode"
+
+    slp = 10
+    for i in range(tries):
+        try:
+            rsp = requests.post(url=URL_SEND_LOGIN_OTP, json={"fy_id": conf['clientid'], "app_id": conf['appid']}, timeout=TIMEOUT)
+            r1 = json.loads(rsp.text)
+            rk = r1["request_key"]
+
+            totp = pyotp.TOTP(conf['factor2']).now()
+
+            rsp = requests.post(url=URL_VERIFY_TOTP, json={"request_key": rk, "otp": totp}, timeout=TIMEOUT)
+            r2 = json.loads(rsp.text)
+            rk2 = r2["request_key"]
+
+            rsp = requests.post(url=URL_VERIFY_PIN, json={"request_key": rk2, "identity_type": "pin", "identifier": conf['pin']}, timeout=TIMEOUT)
+            r3 = json.loads(rsp.text)
+            at1 = r3["data"]["access_token"]
+
+            rsp = requests.post(url=URL_TOKEN, json={"fyers_id": conf['clientid'], "app_id": conf['appid'], "redirect_uri": conf['redirect_uri'], "appType": conf['apptype'], "code_challenge": "", "state": "sample_state", "scope": "", "nonce": "", "response_type": "code", "create_cookie": True}, headers={'Authorization': f'Bearer {at1}'}, timeout=TIMEOUT)
+            r4 = json.loads(rsp.text)
+            url = r4["Url"]
+            ac1 = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)['auth_code'][0]
+
+            app_id_hash = conf['appid']+'-'+conf['apptype']+':'+conf['secretid']
+            app_id_hash = sha256(app_id_hash.encode('utf-8')).hexdigest()
+
+            rsp = requests.post(url=URL_VALIDATE_AUTH_CODE, json={"grant_type": "authorization_code", "appIdHash": app_id_hash, "code": ac1}, timeout=TIMEOUT)
+            logging.info(rsp.text)
+            r5 = json.loads(rsp.text)
+            access_token = conf['appid']+'-'+conf['apptype']+':'+r5["access_token"]
+
+            logging.info('Login successful.')
+            return access_token
+        except:
+            logging.error(traceback.format_exc())
+            logging.error(rsp.text)
+            time.sleep(slp)
+            slp += 10
+    else:
+        logging.error('Login failed.')
+        return None
+
+def fyers_match_expiry(fytoken, expirydt, dtformat="%d-%m-%Y", return_lotsize=False):
+    try:
+        row = fyers_master[fyers_master['Fytoken'] == str(int(fytoken))]
+        edt = int(row['Expiry_date'].iloc[0])
+        #dt = datetime.datetime.strptime(expirydt, dtformat)
+        if datetime.datetime.fromtimestamp(edt).strftime(dtformat) == expirydt:
+            if return_lotsize:
+                return int(row['Minimum_lot_size'].iloc[0])
+            return True
+        else:
+            return False
+    except:
+        return False
+
+def fyers_chain(token, sym, strikecount=None, tries=10):
+    headers = {'Authorization': token}
+    params = {'symbol': fyers_names[sym], 'strikecount': strikecount}
+
+    for ix in range(tries):
+        data = rget(nse, 'https://api-t1.fyers.in/data/options-chain-v3', headers, params=params)
+
+        if data is None:
+            logging.error(f'Fyers Chain {sym} - ERROR - None')
+            time.sleep(5)
+        elif data["s"] == "ok":
+            logging.debug(f'Fyers Chain {sym} - SUCCESS')
+
+            if sym not in exp:
+                explist = [j['date'] for j in data['data']['expiryData']]
+                use_exp = sorted(explist, key=lambda x: datetime.datetime.strptime(x, '%d-%m-%Y'))[0]
+
+                use_lotsize = None
+                for j in data['data']['optionsChain']:
+                    if fyers_match_expiry(j['fyToken'], use_exp):
+                        use_lotsize = fyers_match_expiry(j['fyToken'], use_exp, return_lotsize=True)
+                        break
+
+                return use_exp, use_lotsize
+
+            x = data['data']['optionsChain']
+            spot = [j['ltp'] for j in x if j['strike_price'] == -1][0]
+
+            if sym not in strike_range:
+                strikes = [j['strike_price'] for j in x if j['strike_price'] != -1]
+                strikes = sorted(list(set(strikes)))
+                atm = sorted(strikes, key=lambda x: abs(x-spot))[0]
+                strike_range[sym] = strikes[strikes.index(atm)-4:strikes.index(atm)+5]
+            dct = {}
+            filtered = {'data': [], 'spot': spot, 'strikelist': strike_range[sym]}
+            for i in x:
+                if fyers_match_expiry(i['fyToken'], exp[sym]) and i['strike_price'] != -1:
+                    filtered['data'].append(i)
+                    if i['strike_price'] in strike_range[sym]:
+                        dct[f"{i['strike_price']}{i['option_type']}"] = (float(i['ltp']), float(i['oi']), float(i['oich']))
+
+            with open(f'{sym}_chain.json', 'w') as file:
+                json.dump(filtered, file, indent=2)
+
+            return dct, spot
+        elif data["s"] == "error":
+            logging.debug(f'Fyers Chain {sym} - ERROR - {data}.')
+            time.sleep(5)
+
+TIMEOUT = 20
+scrip_code = {'SENSEX': 1, 'BANKEX': 12, 'SX50': 47}
+exp = {} # symbol: expiry_to_use
+lot_sizes = {} # symbol: lot_size
+dfs = {}
+cur_dt = datetime.datetime.now().date()
+next_dt = cur_dt
+while True:
+    next_dt += datetime.timedelta(days=1)
+    if next_dt not in HOLIDAYS and (next_dt.weekday() < 5 or next_dt in EXTRAS):
+        break
+
+strike_range = {} # 4 OTM + ATM + 4 ITM
+oidata = {}
+oichain = {}
+dfcols = ['Time', 'Analysis', 'CW_strike', 'CW_lots', 'CC_strike', 'CC_lots', 'CE_lots', 'Spot', 'PE_lots', 'PW_strike', 'PW_lots', 'PC_strike', 'PC_lots']
+
+nse = requests.session()
+nse_headers = {'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'}
+nse_status_ep = 'https://www.nseindia.com/api/marketStatus'
+rget(nse, 'https://www.nseindia.com', headers=nse_headers, return_json=False)
+nse_token = None # Samco token
+
+bse = requests.session()
+bse_headers = {'origin': 'https://www.bseindia.com', 'referer': 'https://www.bseindia.com', 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'}
+bse_status_ep = 'https://api.bseindia.com/RealTimeBseIndiaAPI/api/GetSensexData/w?code={}'
+
+if use_token:
+    with open("all_broker_tokens.json") as file:
+        fyers_token = json.load(file)['fyers']['token']
+elif use_token is None:
+    fyers_token = "A6TZ0RFMRN-100:eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJhcGkuZnllcnMuaW4iLCJpYXQiOjE3MjI2NzY0MjUsImV4cCI6MTcyMjczMTQ0NSwibmJmIjoxNzIyNjc2NDI1LCJhdWQiOlsieDowIiwieDoxIiwieDoyIiwiZDoxIiwiZDoyIiwieDoxIiwieDowIl0sInN1YiI6ImFjY2Vzc190b2tlbiIsImF0X2hhc2giOiJnQUFBQUFCbXJmVEpLOGR3RTNmdjNFS1d5ckdfRkhjVVNRdkloYjNXY3diV3kzbDlOTlhKNnI0RXJvM2hjbXQ1OHY5cFgzMnRVLXpySFE4REtESVZGQlJ0ZWZ5Y0hBdVY3bmFodUhWU3drNXJ1NFBZUHZZNWJ4az0iLCJkaXNwbGF5X25hbWUiOiJNQU5HRVNIIEJBQlUgU0FCTEUiLCJvbXMiOiJLMSIsImhzbV9rZXkiOiIzMjFjNGVmMjEzNDQxOGY3MjAwZTFmOTliNWIwNDVmN2NkNzY5Zjk0MjgwMjhkYTI4NTkzY2ZhZiIsImZ5X2lkIjoiRk0wMDk3IiwiYXBwVHlwZSI6MTAwLCJwb2FfZmxhZyI6Ik4ifQ.r7lug7NGZISTNq8qwYXsHHGFGPV9cQ5u0VD7vXKX8JI"
+else:
+    with open("fyers_cred.json") as file:
+        fyers_cred = json.load(file)['fyers']
+    fyers_token = fyers_login(fyers_cred)
+
+if fyers_token is None:
+    msg = "Fyers login failed, exiting..."
+    tgsendmsg(msg, error=True)
+    raise Exception(msg)
+
+req1 = rget(nse, "https://public.fyers.in/sym_details/NSE_FO.csv", {}, return_json=False)
+req2 = rget(nse, "https://public.fyers.in/sym_details/BSE_FO.csv", {}, return_json=False)
+req3 = rget(nse, "https://public.fyers.in/sym_details/NSE_CM.csv", {}, return_json=False)
+if req1 is None or req2 is None or req3 is None:
+    msg = "Fyers master fetch failed, exiting..."
+    tgsendmsg(msg, error=True)
+    raise Exception(msg)
+fyers_master_raw1 = StringIO(req1.text)
+fyers_master_raw2 = StringIO(req2.text)
+fyers_master_raw3 = StringIO(req3.text)
+fyers_master1 = pd.read_csv(fyers_master_raw1, dtype=object, header=None, names=['Fytoken', 'Symbol_Details', 'Exchange_Instrument_type', 'Minimum_lot_size', 'Tick_size', 'ISIN', 'Trading_Session', 'Last_update_date', 'Expiry_date', 'Symbol_ticker', 'Exchange', 'Segment', 'Scrip_code', 'Underlying_symbol', 'Underlying_scrip_code', 'Strike_price', 'Option_type', 'Underlying_FyToken', 'Reserved_column1', 'Reserved_column2', 'Reserved_column3'])
+fyers_master2 = pd.read_csv(fyers_master_raw2, dtype=object, header=None, names=['Fytoken', 'Symbol_Details', 'Exchange_Instrument_type', 'Minimum_lot_size', 'Tick_size', 'ISIN', 'Trading_Session', 'Last_update_date', 'Expiry_date', 'Symbol_ticker', 'Exchange', 'Segment', 'Scrip_code', 'Underlying_symbol', 'Underlying_scrip_code', 'Strike_price', 'Option_type', 'Underlying_FyToken', 'Reserved_column1', 'Reserved_column2', 'Reserved_column3'])
+fyers_master = pd.concat([fyers_master1, fyers_master2])
+fyers_cash_master = pd.read_csv(fyers_master_raw3, dtype=object, header=None, names=['Fytoken', 'Symbol_Details', 'Exchange_Instrument_type', 'Minimum_lot_size', 'Tick_size', 'ISIN', 'Trading_Session', 'Last_update_date', 'Expiry_date', 'Symbol_ticker', 'Exchange', 'Segment', 'Scrip_code', 'Underlying_symbol', 'Underlying_scrip_code', 'Strike_price', 'Option_type', 'Underlying_FyToken', 'Reserved_column1', 'Reserved_column2', 'Reserved_column3'])
+
+fyers_names = {
+    'NIFTY': 'NSE:NIFTY50-INDEX',
+    'BANKNIFTY': 'NSE:NIFTYBANK-INDEX',
+    'FINNIFTY': 'NSE:FINNIFTY-INDEX',
+    'MIDCPNIFTY': 'NSE:MIDCPNIFTY-INDEX',
+    'SENSEX': 'BSE:SENSEX-INDEX',
+    'BANKEX': 'BSE:BANKEX-INDEX',
+    }
+
+wtime = int((datetime.datetime.combine(cur_dt, datetime.time(9, 15)) - datetime.datetime.now()).total_seconds())
+if wtime > 0:
+    time.sleep(wtime + 20)
+
+"""
+df = pd.DataFrame(columns=dfcols)
+df.loc[len(df)] = [0,100,200, 1,1,1,1,1,1,1,1,15000]
+df.loc[len(df)] = [0,200,100, 1,1,1,1,1,1,1,1,15150]
+df_image(df, 'a', 'a')
+"""
+
+market_status = int(rget(bse, bse_status_ep.format(16), bse_headers)[0]['F']) # 0 OPEN, 2 CLOSED, 1 PRE-OPEN?
+if not debug_mode and market_status != 0:
+    raise Exception("Market closed, exiting...")
+
+'''
+market_status = rget(nse, nse_status_ep, nse_headers)
+for i in market_status['marketState']:
+    if i['market']=='Capital Market':
+        if not debug_mode and i['marketStatus'] in ['Closed', 'Close']:
+            raise Exception("Market closed, exiting...")
+'''
+
+for i in use_syms:
+    if i not in fyers_names:
+        row = fyers_cash_master[fyers_cash_master['Underlying_symbol'] == i]
+        if len(row) > 0:
+            fyers_names[i] = row['Symbol_ticker'].iloc[0]
+        else:
+            msg = f"Symbol {i} not found in Fyers cash master, skipping..."
+            tgsendmsg(msg, error=True)
+            logging.error(msg)
+            continue
+    exp[i], lot_sizes[i] = fyers_chain(fyers_token, i)
+    if lot_sizes[i] is None:
+        msg = f'Failed to assign lot size for {i}.'
+        tgsendmsg(msg, error=True)
+        logging.error(msg)
+
+today = []
+for i in exp:
+    # run on all indices on all days
+    if True or (exp[i] in [cur_dt.strftime('%d-%m-%Y'), cur_dt.strftime('%d %b %Y'), next_dt.strftime('%d-%m-%Y'), next_dt.strftime('%d %b %Y')]) or (i in ['NIFTY', 'BANKNIFTY']):
+        today.append(i)
+        dfs[i] = pd.DataFrame(columns=dfcols)
+        oidata[i] = {} # {'0918' : {19500CE: (price, oi, coi), 19600PE: (price, oi, coi)...}...}
+today = sorted(today) # sorted so BANKEX and SENSEX have 8 seconds gap
+tgsendids = dict(zip(today, [None]*len(today)))
+
+def main(i, dbc):
+    while True:
+        tm = datetime.datetime.now()
+        timekey = tm.strftime('%H%M')
+        timekey2 = tm.strftime('%H:%M')
+
+        chain, spotprice = fyers_chain(fyers_token, i)
+        oidata[i][timekey] = chain
+        if len(oidata[i])==1:
+            prevkey = None
+        else:
+            prevkey = list(oidata[i].keys())[-2]
+        updt = dict(zip(dfcols, [0]*len(dfcols)))
+        updt['Spot'] = spotprice
+        updt['Time'] = timekey2
+        ce_chg = {}
+        pe_chg = {}
+        ce_price_chg = {}
+        pe_price_chg = {}
+        for j in chain:
+            if j[-2:]=='CE':
+                updt['CE_lots'] += chain[j][2]
+                if prevkey is not None:
+                    ce_chg[j] = chain[j][2] - oidata[i][prevkey][j][2]
+                    ce_price_chg[j] = round(100 * (chain[j][0] - oidata[i][prevkey][j][0])/oidata[i][prevkey][j][0], 2)
+            elif j[-2:]=='PE':
+                updt['PE_lots'] += chain[j][2]
+                if prevkey is not None:
+                    pe_chg[j] = chain[j][2] - oidata[i][prevkey][j][2]
+                    pe_price_chg[j] = round(100 * (chain[j][0] - oidata[i][prevkey][j][0])/oidata[i][prevkey][j][0], 2)
+        if prevkey is not None:
+            cw = max(ce_chg.values())
+            cc = min(ce_chg.values())
+            pw = max(pe_chg.values())
+            pc = min(pe_chg.values())
+            for j in chain:
+                if j[-2:]=='CE' and ce_chg[j]==cw:
+                    updt['CW_strike'] = j
+                    updt['CW_lots'] = ce_chg[j]
+                elif j[-2:]=='CE' and ce_chg[j]==cc:
+                    updt['CC_strike'] = j
+                    updt['CC_lots'] = ce_chg[j]
+                elif j[-2:]=='PE' and pe_chg[j]==pw:
+                    updt['PW_strike'] = j
+                    updt['PW_lots'] = pe_chg[j]
+                elif j[-2:]=='PE' and pe_chg[j]==pc:
+                    updt['PC_strike'] = j
+                    updt['PC_lots'] = pe_chg[j]
+        for j in updt:
+            if '_lots' in j and lot_sizes[i] is not None:
+                updt[j] = round(updt[j]/lot_sizes[i])
+
+        updt['Analysis'] = '-'
+
+        '''
+        if len(oidata[i]) > 2:
+            prev_analysis = dfs[i].loc[len(dfs[i])-1]['Analysis']
+            updt['Analysis'] = prev_analysis
+
+            if (updt['CE_lots'] >= dfs[i].iloc[-1]['CE_lots'] * 1.028) and (updt['PE_lots'] <= dfs[i].iloc[-1]['PE_lots'] * 0.972):
+                if (dfs[i].iloc[-1]['CE_lots'] >= dfs[i].iloc[-2]['CE_lots'] * 1.022) and (updt[dfs[i].iloc[-1]] <= dfs[i].iloc[-2]['PE_lots'] * 0.978):
+                    updt['Analysis'] = 'Bear'
+            elif (updt['PE_lots'] >= dfs[i].iloc[-1]['PE_lots'] * 1.028) and (updt['CE_lots'] <= dfs[i].iloc[-1]['CE_lots'] * 0.972):
+                if (dfs[i].iloc[-1]['PE_lots'] >= dfs[i].iloc[-2]['PE_lots'] * 1.022) and (dfs[i].iloc[-1]['CE_lots'] <= dfs[i].iloc[-2]['CE_lots'] * 0.978):
+                    updt['Analysis'] = 'Bull'
+            elif (updt['PE_lots'] >= dfs[i].iloc[-1]['PE_lots'] * 1.028) and (updt['CE_lots'] >= dfs[i].iloc[-1]['CE_lots'] * 1.028):
+                if (dfs[i].iloc[-1]['PE_lots'] >= dfs[i].iloc[-2]['PE_lots'] * 1.022) and (dfs[i].iloc[-1]['CE_lots'] >= dfs[i].iloc[-2]['CE_lots'] * 1.022):
+                    updt['Analysis'] = 'Neutral'
+            elif (updt['PE_lots'] <= dfs[i].iloc[-1]['PE_lots'] * 0.972) and (updt['CE_lots'] <= dfs[i].iloc[-1]['CE_lots'] * 0.972):
+                if (dfs[i].iloc[-1]['PE_lots'] <= dfs[i].iloc[-2]['PE_lots'] * 0.978) and (dfs[i].iloc[-1]['CE_lots'] <= dfs[i].iloc[-2]['CE_lots'] * 0.978):
+                    updt['Analysis'] = 'Neutral'
+
+            if debug_mode or updt['Analysis'] != prev_analysis:
+                tgsendmsg(f'{i} - OI Changed From {prev_analysis} to {updt["Analysis"]} - spot price is {updt["Spot"]}.')
+        '''
+
+        ## add option day high, day low
+        ## add spot ltp and 3m change
+        msgs = []
+        if prevkey is not None:
+            for j in chain:
+                if chain[j][0] < 5:
+                    pass
+                elif j[-2:]=='CE':
+                    if ce_price_chg[j] >= 30 and ce_chg[j]/oidata[i][prevkey][j][1] <= -0.03:
+                        msgs.append([f'{i} {j}', 'BUY', str(chain[j][0])])
+                    elif ce_price_chg[j] <= -30 and ce_chg[j]/oidata[i][prevkey][j][1] >= 0.03:
+                        msgs.append([f'{i} {j}', 'SELL', str(chain[j][0])])
+                elif j[-2:]=='PE':
+                    if pe_price_chg[j] >= 30 and pe_chg[j]/oidata[i][prevkey][j][1] <= -0.03:
+                        msgs.append([f'{i} {j}', 'BUY', str(chain[j][0])])
+                    elif pe_price_chg[j] <= -30 and pe_chg[j]/oidata[i][prevkey][j][1] >= 0.03:
+                        msgs.append([f'{i} {j}', 'SELL', str(chain[j][0])])
+
+        if len(msgs) > 0:
+            msgs2 = [' - '.join(x) for x in msgs]
+            msgs3 = '\n'.join(msgs2)
+            tgsendmsg(msgs3)
+
+        dfs[i].loc[len(dfs[i])] = updt
+
+        df_image(dfs[i], i, timekey2)
+
+        tm = datetime.datetime.now()
+
+        if not debug_mode and tm.hour>=15 and tm.minute>=27:
+            break
+        elif debug_mode:
+            time.sleep(30)
+        else:
+            time.sleep(180 - round(time.time() % 180) + dbc)
+
+dbc = 5
+for i in today:
+    t = Thread(target=main, args=(i,dbc))
+    t.start()
+    dbc += 2
